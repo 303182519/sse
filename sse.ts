@@ -48,16 +48,6 @@ enum SSEState {
 }
 
 
-type StateTransition =
-	| { from: SSEState.IDLE; to: SSEState.CONNECTING }
-	| { from: SSEState.CONNECTING; to: SSEState.OPEN }
-	| { from: SSEState.CONNECTING; to: SSEState.RECONNECTING }
-	| { from: SSEState.OPEN; to: SSEState.RECONNECTING }
-	| { from: SSEState.RECONNECTING; to: SSEState.OPEN }
-	| { from: SSEState.RECONNECTING; to: SSEState.CLOSED }
-	| { from: SSEState.IDLE; to: SSEState.CLOSED }
-	| { from: SSEState.OPEN; to: SSEState.CLOSED };
-
 type SSEEventHandler = (event: SSEEvent) => void;
 type StateChangeHandler = (state: SSEState) => void;
 
@@ -67,6 +57,7 @@ interface ReconnectStrategy {
 	baseDelay: number;         // 基础延迟（ms）
 	maxDelay: number;          // 最大延迟（ms）
 	jitter: boolean;           // 是否添加随机抖动
+	stableDuration: number;    // 连接稳定多久后清零重试计数（ms），<=0 表示连上即清零
 }
 
 function calculateDelay(
@@ -111,6 +102,7 @@ class SSEClient {
 	private lastEventId: string | null = null;
 	private abortController: AbortController | null = null;
 	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	private stableTimer: ReturnType<typeof setTimeout> | null = null;
 
 	private eventHandlers = new Map<string, Set<SSEEventHandler>>();
 	private stateHandlers = new Set<StateChangeHandler>();
@@ -124,6 +116,7 @@ class SSEClient {
 			baseDelay: 1000,
 			maxDelay: 30000,
 			jitter: true,
+			stableDuration: 30000,
 			...options.reconnect,
 		};
 	}
@@ -169,8 +162,11 @@ class SSEClient {
 				throw error;
 			}
 
-			this.retryCount = 0;
 			this.transition(SSEState.OPEN);
+
+			// 连接刚建立时不清零重试计数：只有稳定保持一段时间才视为恢复，
+			// 避免服务端「接受连接后立刻断开」导致重试计数被反复清零、无限重连
+			this.startStableTimer();
 
 			await this.consumeStream(response);
 		} catch (error: any) {
@@ -231,6 +227,7 @@ class SSEClient {
 	private tryReconnect(error: Error): void {
 		if (this.retryCount >= this.reconnectStrategy.maxRetries) {
 			this.transition(SSEState.CLOSED);
+			this.emitError('reconnect_failed', error);
 			return;
 		}
 
@@ -253,6 +250,29 @@ class SSEClient {
 		if (this.reconnectTimer) {
 			clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = null;
+		}
+	}
+
+	// 连接稳定计时：持续 stableDuration 后才清零重试计数
+	private startStableTimer(): void {
+		this.clearStableTimer();
+
+		const { stableDuration } = this.reconnectStrategy;
+		if (stableDuration <= 0) {
+			this.retryCount = 0;
+			return;
+		}
+
+		this.stableTimer = setTimeout(() => {
+			this.retryCount = 0;
+			this.stableTimer = null;
+		}, stableDuration);
+	}
+
+	private clearStableTimer(): void {
+		if (this.stableTimer) {
+			clearTimeout(this.stableTimer);
+			this.stableTimer = null;
 		}
 	}
 
@@ -365,6 +385,12 @@ class SSEClient {
 	private transition(newState: SSEState): void {
 		const oldState = this.state;
 		this.state = newState;
+
+		// 稳定性计时只在 OPEN 状态下有效，离开 OPEN 立即取消
+		if (oldState === SSEState.OPEN && newState !== SSEState.OPEN) {
+			this.clearStableTimer();
+		}
+
 		if (oldState !== newState) {
 			for (const handler of this.stateHandlers) {
 				handler(newState);

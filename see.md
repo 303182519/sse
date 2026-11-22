@@ -18,6 +18,7 @@ const client = new SSEClient({
     baseDelay: 500,
     maxDelay: 60000,
     jitter: true,
+    stableDuration: 30000, // 连接稳定 30s 后才清零重试计数，防止抖动导致无限重连
   },
 });
 
