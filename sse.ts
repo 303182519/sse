@@ -336,6 +336,10 @@ class SSEClient {
 				const { done, value } = await reader.read();
 
 				if (done) {
+					// 用户主动断开后 EOF 到达：正常结束，静默退出，不误报为意外断开
+					if (this.abortReason === 'manual' || this.state === SSEState.CLOSED) {
+						break;
+					}
 					// 服务端关闭了事件流（EOF）。SSE 是长连接，不应主动结束，视为意外断开，触发重连
 					this.tryReconnect({ type: 'stream', message: 'Stream ended unexpectedly' });
 					break;
@@ -449,6 +453,11 @@ class SSEClient {
 	// === 重连逻辑 ===
 
 	private tryReconnect(error: SSEError, overrideDelay?: number): void {
+		// 用户已主动关闭（如收到业务 done 后 disconnect），不再调度重连
+		if (this.state === SSEState.CLOSED) {
+			return;
+		}
+
 		if (this.retryCount >= this.reconnectStrategy.maxRetries) {
 			this.transition(SSEState.CLOSED);
 			this.emitError('reconnect_failed', error);
