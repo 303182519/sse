@@ -3,6 +3,20 @@ interface SSEEvent {
 	event?: string;
 	data: string;
 	retry?: number;
+	/** 结构化错误信息（仅错误类事件携带，如 auth_error / reconnect_failed） */
+	error?: SSEError;
+}
+
+type SSEErrorType = 'http' | 'network' | 'stream' | 'timeout' | 'heartbeat';
+
+interface SSEError {
+	type: SSEErrorType;
+	/** HTTP 状态码（网络层错误时为空） */
+	status?: number;
+	message: string;
+	/** 服务端通过 Retry-After 响应头建议的等待时长（ms） */
+	retryAfterMs?: number;
+	cause?: unknown;
 }
 
 function parseSSEEvent(text: string): SSEEvent {
@@ -10,7 +24,7 @@ function parseSSEEvent(text: string): SSEEvent {
 	const lines = text.split(/\r\n|\r|\n/);
 
 	for (const line of lines) {
-		if (line.startsWith(':')) continue; // 注释行，忽略
+		if (line.startsWith(':')) continue; // 注释行（通常用作心跳），忽略内容，仅用于活性检测
 
 		const colonIndex = line.indexOf(':');
 		if (colonIndex === -1) continue;
@@ -38,6 +52,15 @@ function parseSSEEvent(text: string): SSEEvent {
 	return result;
 }
 
+// Retry-After 支持两种格式：秒数 或 HTTP 日期
+function parseRetryAfter(value: string): number | undefined {
+	const seconds = Number(value);
+	if (!Number.isNaN(seconds)) return Math.max(0, seconds * 1000);
+	const date = Date.parse(value);
+	if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
+	return undefined;
+}
+
 
 enum SSEState {
 	IDLE = 'idle',
@@ -50,6 +73,22 @@ enum SSEState {
 
 type SSEEventHandler = (event: SSEEvent) => void;
 type StateChangeHandler = (state: SSEState) => void;
+
+interface SSELogger {
+	debug(message: string, ...args: unknown[]): void;
+	info(message: string, ...args: unknown[]): void;
+	warn(message: string, ...args: unknown[]): void;
+	error(message: string, ...args: unknown[]): void;
+}
+
+// 可观测性钩子：全部可选，用于接入监控系统（Prometheus、Sentry 等）
+interface SSEMetrics {
+	onOpen?(): void;
+	onClose?(): void;
+	onReconnectAttempt?(attempt: number, delay: number): void;
+	onEvent?(event: SSEEvent): void;
+	onError?(error: SSEError): void;
+}
 
 
 interface ReconnectStrategy {
@@ -87,13 +126,31 @@ function calculateDelay(
 // 重试6+: 30000ms → 30s（封顶）
 
 
+// 动态凭证：每次（重）连接前重新求值，解决 token 刷新后重连仍携带旧凭证的问题
+type HeaderFactory = () => Record<string, string> | Promise<Record<string, string>>;
+
 interface SSEClientOptions {
 	url: string;
 	method?: string;
-	headers?: Record<string, string>;
+	headers?: Record<string, string> | HeaderFactory;
 	body?: string;
 	reconnect?: Partial<ReconnectStrategy>;
 	withCredentials?: boolean;
+	/** 初始 Last-Event-ID，用于跨页面刷新的断点续传 */
+	lastEventId?: string;
+	/**
+	 * 心跳超时（ms）：超过该时长未收到任何字节（含注释行心跳），
+	 * 判定连接已被中间设备静默断链，主动断开并重连。<=0 关闭。默认 45000
+	 */
+	heartbeatTimeout?: number;
+	/** 连接建立阶段（收到响应头之前）的超时（ms），<=0 关闭。默认 30000 */
+	requestTimeout?: number;
+	/** 日志注入，默认 console，用于接入统一日志体系 */
+	logger?: SSELogger;
+	/** 可观测性钩子 */
+	metrics?: SSEMetrics;
+	/** 网络恢复（online 事件）时是否立即重连，默认 true */
+	reconnectOnOnline?: boolean;
 }
 
 class SSEClient {
@@ -101,14 +158,26 @@ class SSEClient {
 	private retryCount = 0;
 	private lastEventId: string | null = null;
 	private abortController: AbortController | null = null;
+	/** 区分 abort 的来源：用户主动断开 / 心跳超时 / 连接超时，决定是否自动重连 */
+	private abortReason: 'manual' | 'heartbeat' | 'timeout' | null = null;
 	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	private stableTimer: ReturnType<typeof setTimeout> | null = null;
+	private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+	private lastActivityAt = 0;
+	/** 服务端通过 retry: 字段下发的重连间隔（ms），优先级高于本地退避计算 */
+	private serverRetryMs: number | null = null;
+	private networkListenersBound = false;
 
 	private eventHandlers = new Map<string, Set<SSEEventHandler>>();
 	private stateHandlers = new Set<StateChangeHandler>();
 	private middlewares: SSEMiddleware[] = [];
 
 	private reconnectStrategy: ReconnectStrategy;
+	private readonly logger: SSELogger;
+	private readonly metrics?: SSEMetrics;
+	private readonly heartbeatTimeout: number;
+	private readonly requestTimeout: number;
+	private readonly reconnectOnOnline: boolean;
 
 	constructor(private options: SSEClientOptions) {
 		this.reconnectStrategy = {
@@ -119,6 +188,12 @@ class SSEClient {
 			stableDuration: 30000,
 			...options.reconnect,
 		};
+		this.logger = options.logger ?? console;
+		this.metrics = options.metrics;
+		this.heartbeatTimeout = options.heartbeatTimeout ?? 45000;
+		this.requestTimeout = options.requestTimeout ?? 30000;
+		this.reconnectOnOnline = options.reconnectOnOnline ?? true;
+		this.lastEventId = options.lastEventId ?? null;
 	}
 
 	// === 连接管理 ===
@@ -133,33 +208,62 @@ class SSEClient {
 			this.retryCount = 0;
 		}
 
+		this.abortReason = null;
 		this.transition(SSEState.CONNECTING);
 		this.abortController = new AbortController();
+		this.bindEnvironmentListeners();
+
+		// 连接建立阶段超时：fetch 在收到响应头之前可能无限挂起
+		let requestTimer: ReturnType<typeof setTimeout> | null = null;
+		if (this.requestTimeout > 0) {
+			requestTimer = setTimeout(() => this.abort('timeout'), this.requestTimeout);
+		}
 
 		try {
+			// 每次连接前动态求值，保证重连时使用最新凭证
+			const dynamicHeaders =
+				typeof this.options.headers === 'function'
+					? await this.options.headers()
+					: this.options.headers;
+
 			const headers: Record<string, string> = {
 				Accept: 'text/event-stream',
-				...this.options.headers,
+				...dynamicHeaders,
 			};
 
 			if (this.lastEventId) {
 				headers['Last-Event-ID'] = this.lastEventId;
 			}
 
-			const response = await fetch(this.options.url, {
-				method: this.options.method ?? 'GET',
-				headers,
-				body: this.options.body,
-				signal: this.abortController.signal,
-				credentials: this.options.withCredentials ? 'include' : 'same-origin',
-			});
+			let response: Response;
+			try {
+				response = await fetch(this.options.url, {
+					method: this.options.method ?? 'GET',
+					headers,
+					body: this.options.body,
+					signal: this.abortController.signal,
+					credentials: this.options.withCredentials ? 'include' : 'same-origin',
+				});
+			} finally {
+				if (requestTimer) clearTimeout(requestTimer);
+			}
 
 			if (!response.ok) {
-				const error: Error & { status?: number } = new Error(
+				const error: Error & { status?: number; retryAfterMs?: number } = new Error(
 					`HTTP ${response.status}: ${response.statusText}`
 				);
 				error.status = response.status;
+				const retryAfter = response.headers.get('retry-after');
+				if (retryAfter) {
+					error.retryAfterMs = parseRetryAfter(retryAfter);
+				}
 				throw error;
+			}
+
+			// 校验 Content-Type，防止网关/负载均衡返回的错误页（200 + HTML）被当作事件流消费
+			const contentType = response.headers.get('content-type') ?? '';
+			if (!contentType.includes('text/event-stream')) {
+				throw new Error(`Unexpected Content-Type: ${contentType || '(missing)'}`);
 			}
 
 			this.transition(SSEState.OPEN);
@@ -168,28 +272,62 @@ class SSEClient {
 			// 避免服务端「接受连接后立刻断开」导致重试计数被反复清零、无限重连
 			this.startStableTimer();
 
+			// 启动心跳活性检测，防止代理/NAT 静默断链后无限挂起
+			this.resetHeartbeat();
+
 			await this.consumeStream(response);
 		} catch (error: any) {
-			if (error.name === 'AbortError') {
-				// 主动断开，不需要重连
+			if (error?.name === 'AbortError') {
+				if (this.abortReason === 'manual') {
+					// 主动断开，不需要重连
+					return;
+				}
+				this.handleError({
+					type: 'timeout',
+					message: `连接建立超时（${this.requestTimeout}ms）`,
+					cause: error,
+				});
 				return;
 			}
 
-			this.handleError(error);
+			this.handleError(this.normalizeError(error));
 		}
 	}
 
 	disconnect(): void {
 		this.clearReconnectTimer();
-		this.abortController?.abort();
+		this.unbindEnvironmentListeners();
+		this.abort('manual');
 		this.abortController = null;
 		this.transition(SSEState.CLOSED);
+	}
+
+	private abort(reason: 'manual' | 'heartbeat' | 'timeout'): void {
+		this.abortReason = reason;
+		this.abortController?.abort();
+	}
+
+	private normalizeError(error: unknown): SSEError {
+		const err = error as Error & { status?: number; retryAfterMs?: number };
+		return {
+			type: err?.status ? 'http' : 'network',
+			status: err?.status,
+			retryAfterMs: err?.retryAfterMs,
+			message: err?.message ?? String(error),
+			cause: error,
+		};
 	}
 
 	// === 流消费 ===
 
 	private async consumeStream(response: Response): Promise<void> {
-		const reader = response.body!.getReader();
+		const body = response.body;
+		if (!body) {
+			this.tryReconnect({ type: 'stream', message: 'Response body is null' });
+			return;
+		}
+
+		const reader = body.getReader();
 		const decoder = new TextDecoder();
 		let buffer = '';
 
@@ -199,9 +337,12 @@ class SSEClient {
 
 				if (done) {
 					// 服务端关闭了事件流（EOF）。SSE 是长连接，不应主动结束，视为意外断开，触发重连
-					this.tryReconnect(new Error('Stream ended unexpectedly'));
+					this.tryReconnect({ type: 'stream', message: 'Stream ended unexpectedly' });
 					break;
 				}
+
+				// 收到任意字节即刷新活性时间戳（含注释行心跳）
+				this.resetHeartbeat();
 
 				buffer += decoder.decode(value, { stream: true });
 				const events = buffer.split(/\r\n\r\n|\r\r|\n\n/);
@@ -216,15 +357,98 @@ class SSEClient {
 				}
 			}
 		} catch (error: any) {
-			if (error.name !== 'AbortError') {
-				this.tryReconnect(error);
+			if (error?.name === 'AbortError') {
+				// 心跳触发的主动 abort：连接已被判定死亡，走重连
+				if (this.abortReason === 'heartbeat') {
+					this.tryReconnect({
+						type: 'heartbeat',
+						message: `心跳超时（${this.heartbeatTimeout}ms 无数据），连接已死亡`,
+						cause: error,
+					});
+				}
+				// manual：用户主动断开，静默结束
+				return;
 			}
+			this.tryReconnect(this.normalizeError(error));
 		}
 	}
 
+	// === 心跳活性检测 ===
+
+	private resetHeartbeat(): void {
+		if (this.heartbeatTimeout <= 0) return;
+		this.lastActivityAt = Date.now();
+		this.clearHeartbeat();
+
+		this.heartbeatTimer = setTimeout(() => {
+			this.heartbeatTimer = null;
+			this.logger.warn(
+				`[SSE] 超过 ${this.heartbeatTimeout}ms 未收到任何数据，判定连接已死，主动重连`
+			);
+			this.abort('heartbeat'); // 中止挂起的 read，由 consumeStream 的 catch 触发重连
+		}, this.heartbeatTimeout);
+	}
+
+	private clearHeartbeat(): void {
+		if (this.heartbeatTimer) {
+			clearTimeout(this.heartbeatTimer);
+			this.heartbeatTimer = null;
+		}
+	}
+
+	// === 网络环境监听 ===
+
+	private bindEnvironmentListeners(): void {
+		if (this.networkListenersBound || typeof window === 'undefined') return;
+		window.addEventListener('offline', this.onOffline);
+		window.addEventListener('online', this.onOnline);
+		if (typeof document !== 'undefined') {
+			document.addEventListener('visibilitychange', this.onVisibilityChange);
+		}
+		this.networkListenersBound = true;
+	}
+
+	private unbindEnvironmentListeners(): void {
+		if (!this.networkListenersBound || typeof window === 'undefined') return;
+		window.removeEventListener('offline', this.onOffline);
+		window.removeEventListener('online', this.onOnline);
+		if (typeof document !== 'undefined') {
+			document.removeEventListener('visibilitychange', this.onVisibilityChange);
+		}
+		this.networkListenersBound = false;
+	}
+
+	private onOffline = (): void => {
+		this.logger.warn('[SSE] 网络已离线，暂停重连，等待网络恢复');
+		this.clearReconnectTimer();
+		// 中止当前连接但不触发自动重连，等待 online 事件驱动
+		this.abort('manual');
+		if (this.state === SSEState.OPEN || this.state === SSEState.CONNECTING) {
+			this.transition(SSEState.RECONNECTING);
+		}
+	};
+
+	private onOnline = (): void => {
+		if (!this.reconnectOnOnline || this.state !== SSEState.RECONNECTING) return;
+		this.logger.info('[SSE] 网络恢复，立即重连');
+		this.retryCount = 0; // 网络环境变化属于新场景，恢复完整重试预算
+		void this.connect();
+	};
+
+	private onVisibilityChange = (): void => {
+		if (typeof document === 'undefined' || document.visibilityState !== 'visible') return;
+		// 后台标签页中定时器会被节流，心跳定时器可能无法按时触发；
+		// 回到前台时主动校验活性，避免「假活」连接
+		if (this.state !== SSEState.OPEN || this.heartbeatTimeout <= 0) return;
+		if (Date.now() - this.lastActivityAt > this.heartbeatTimeout) {
+			this.logger.warn('[SSE] 页面恢复前台，连接已超心跳期限，主动重连');
+			this.abort('heartbeat');
+		}
+	};
+
 	// === 重连逻辑 ===
 
-	private tryReconnect(error: Error): void {
+	private tryReconnect(error: SSEError, overrideDelay?: number): void {
 		if (this.retryCount >= this.reconnectStrategy.maxRetries) {
 			this.transition(SSEState.CLOSED);
 			this.emitError('reconnect_failed', error);
@@ -233,16 +457,24 @@ class SSEClient {
 
 		this.transition(SSEState.RECONNECTING);
 
-		const delay = calculateDelay(this.retryCount, this.reconnectStrategy);
+		// 延迟优先级：显式指定 > 服务端 Retry-After > 服务端 retry: 字段 > 本地指数退避
+		const delay = Math.min(
+			overrideDelay ??
+				error.retryAfterMs ??
+				this.serverRetryMs ??
+				calculateDelay(this.retryCount, this.reconnectStrategy),
+			this.reconnectStrategy.maxDelay
+		);
 		this.retryCount++;
 
-		console.warn(
+		this.metrics?.onReconnectAttempt?.(this.retryCount, delay);
+		this.logger.warn(
 			`[SSE] 连接断开，${delay}ms 后进行第 ${this.retryCount} 次重连...`,
 			error.message
 		);
 
 		this.reconnectTimer = setTimeout(() => {
-			this.connect();
+			void this.connect();
 		}, delay);
 	}
 
@@ -286,6 +518,14 @@ class SSEClient {
 		return this;
 	}
 
+	once(event: string, handler: SSEEventHandler): this {
+		const wrapper: SSEEventHandler = (e) => {
+			this.off(event, wrapper);
+			handler(e);
+		};
+		return this.on(event, wrapper);
+	}
+
 	off(event: string, handler: SSEEventHandler): this {
 		this.eventHandlers.get(event)?.delete(handler);
 		return this;
@@ -296,7 +536,17 @@ class SSEClient {
 		return this;
 	}
 
+	offStateChange(handler: StateChangeHandler): this {
+		this.stateHandlers.delete(handler);
+		return this;
+	}
+
 	private dispatchEvent(event: SSEEvent): void {
+		// SSE 规范：服务端的 retry: 字段用于建议重连间隔
+		if (typeof event.retry === 'number' && !Number.isNaN(event.retry)) {
+			this.serverRetryMs = event.retry;
+		}
+
 		// 执行中间件管道
 		let current = event;
 		for (const middleware of this.middlewares) {
@@ -304,13 +554,14 @@ class SSEClient {
 			try {
 				next = middleware.onEvent(current);
 			} catch (e) {
-				console.error('[SSE] 中间件异常:', e);
+				this.logger.error('[SSE] 中间件异常:', e);
 				continue;
 			}
 			if (!next) return; // 中间件可以吞掉事件
 			current = next;
 		}
 
+		this.metrics?.onEvent?.(current);
 		this.emit(current.event ?? 'message', current);
 	}
 
@@ -323,23 +574,19 @@ class SSEClient {
 			try {
 				handler(sseEvent);
 			} catch (e) {
-				console.error('[SSE] 事件处理器异常:', e);
+				this.logger.error('[SSE] 事件处理器异常:', e);
 			}
 		}
 	}
 
-	// 从错误对象中读取 HTTP 状态码
-	private extractHttpStatus(error: Error): number | undefined {
-		return (error as Error & { status?: number }).status;
+	// 以错误事件的形式通知处理器，保留结构化错误信息（type/status/retryAfterMs）
+	private emitError(event: string, error: SSEError): void {
+		this.emit(event, { event, data: error.message, error });
 	}
 
-	// 以错误事件的形式通知处理器
-	private emitError(event: string, error: Error): void {
-		this.emit(event, { event, data: error.message });
-	}
-
-	private handleError(error: Error): void {
-		const status = this.extractHttpStatus(error);
+	private handleError(error: SSEError): void {
+		this.metrics?.onError?.(error);
+		const status = error.status;
 
 		if (status) {
 			switch (true) {
@@ -357,8 +604,7 @@ class SSEClient {
 					break;
 
 				case status === 429:
-					// 限流，等更长时间再重试
-					this.retryCount += 2; // 跳过一些重试次数以增加延迟
+					// 限流：优先遵循服务端 Retry-After，否则走常规退避
 					this.tryReconnect(error);
 					break;
 
@@ -374,7 +620,7 @@ class SSEClient {
 					break;
 			}
 		} else {
-			// 网络错误（无HTTP状态码），适合重连
+			// 网络错误 / 超时 / Content-Type 异常（可能是网关瞬态故障），适合重连
 			this.tryReconnect(error);
 		}
 	}
@@ -386,10 +632,14 @@ class SSEClient {
 		const oldState = this.state;
 		this.state = newState;
 
-		// 稳定性计时只在 OPEN 状态下有效，离开 OPEN 立即取消
+		// 稳定性计时与心跳检测只在 OPEN 状态下有效，离开 OPEN 立即取消
 		if (oldState === SSEState.OPEN && newState !== SSEState.OPEN) {
 			this.clearStableTimer();
+			this.clearHeartbeat();
 		}
+
+		if (newState === SSEState.OPEN) this.metrics?.onOpen?.();
+		if (newState === SSEState.CLOSED) this.metrics?.onClose?.();
 
 		if (oldState !== newState) {
 			for (const handler of this.stateHandlers) {
@@ -400,6 +650,11 @@ class SSEClient {
 
 	getState(): SSEState {
 		return this.state;
+	}
+
+	/** 当前断点位置，可持久化后通过 options.lastEventId 注入实现跨刷新续传 */
+	getLastEventId(): string | null {
+		return this.lastEventId;
 	}
 
 	// === 中间件 ===
@@ -417,8 +672,10 @@ interface SSEMiddleware {
 
 // 日志中间件
 class LoggingMiddleware implements SSEMiddleware {
+	constructor(private logger: SSELogger = console) { }
+
 	onEvent(event: SSEEvent): SSEEvent {
-		console.log(`[SSE Event] type=${event.event ?? 'message'} data=${event.data.slice(0, 100)}`);
+		this.logger.info(`[SSE Event] type=${event.event ?? 'message'} data=${event.data.slice(0, 100)}`);
 		return event;
 	}
 }
