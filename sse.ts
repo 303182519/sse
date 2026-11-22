@@ -220,23 +220,26 @@ class SSEClient {
 		}
 
 		try {
-			// 每次连接前动态求值，保证重连时使用最新凭证
-			const dynamicHeaders =
-				typeof this.options.headers === 'function'
-					? await this.options.headers()
-					: this.options.headers;
-
-			const headers: Record<string, string> = {
-				Accept: 'text/event-stream',
-				...dynamicHeaders,
-			};
-
-			if (this.lastEventId) {
-				headers['Last-Event-ID'] = this.lastEventId;
-			}
-
 			let response: Response;
 			try {
+				// 每次连接前动态求值，保证重连时使用最新凭证。
+				// HeaderFactory 与 fetch 纳入同一个 try/finally：
+				// 否则 HeaderFactory 抛异常时 requestTimer 残留，
+				// 之后触发会误 abort 重连后的新连接
+				const dynamicHeaders =
+					typeof this.options.headers === 'function'
+						? await this.options.headers()
+						: this.options.headers;
+
+				const headers: Record<string, string> = {
+					Accept: 'text/event-stream',
+					...dynamicHeaders,
+				};
+
+				if (this.lastEventId) {
+					headers['Last-Event-ID'] = this.lastEventId;
+				}
+
 				response = await fetch(this.options.url, {
 					method: this.options.method ?? 'GET',
 					headers,
@@ -245,7 +248,11 @@ class SSEClient {
 					credentials: this.options.withCredentials ? 'include' : 'same-origin',
 				});
 			} finally {
-				if (requestTimer) clearTimeout(requestTimer);
+				// 响应头到达（或任意异常）后，连接建立阶段结束，超时定时器必须清理
+				if (requestTimer) {
+					clearTimeout(requestTimer);
+					requestTimer = null;
+				}
 			}
 
 			if (!response.ok) {
@@ -296,9 +303,13 @@ class SSEClient {
 
 	disconnect(): void {
 		this.clearReconnectTimer();
+		this.clearStableTimer();
+		this.clearHeartbeat();
+
 		this.unbindEnvironmentListeners();
 		this.abort('manual');
 		this.abortController = null;
+
 		this.transition(SSEState.CLOSED);
 	}
 
@@ -336,10 +347,25 @@ class SSEClient {
 				const { done, value } = await reader.read();
 
 				if (done) {
+					// 多字节 UTF-8 字符可能被拆在不同 chunk，
+					// EOF 时 flush 解码器内部残留的字节
+					buffer += decoder.decode();
+
 					// 用户主动断开后 EOF 到达：正常结束，静默退出，不误报为意外断开
 					if (this.abortReason === 'manual' || this.state === SSEState.CLOSED) {
 						break;
 					}
+
+					// 连接异常结束时，buffer 里可能残留未以空行结束的半条事件。
+					// 按协议不完整事件只能丢弃并记录，不能解析半条 JSON 交给业务层
+					if (buffer.trim()) {
+						this.logger.warn(
+							'[SSE] 连接异常结束，丢弃未完整结束的事件:',
+							buffer.slice(0, 200)
+						);
+						buffer = '';
+					}
+
 					// 服务端关闭了事件流（EOF）。SSE 是长连接，不应主动结束，视为意外断开，触发重连
 					this.tryReconnect({ type: 'stream', message: 'Stream ended unexpectedly' });
 					break;
@@ -469,9 +495,9 @@ class SSEClient {
 		// 延迟优先级：显式指定 > 服务端 Retry-After > 服务端 retry: 字段 > 本地指数退避
 		const delay = Math.min(
 			overrideDelay ??
-				error.retryAfterMs ??
-				this.serverRetryMs ??
-				calculateDelay(this.retryCount, this.reconnectStrategy),
+			error.retryAfterMs ??
+			this.serverRetryMs ??
+			calculateDelay(this.retryCount, this.reconnectStrategy),
 			this.reconnectStrategy.maxDelay
 		);
 		this.retryCount++;
@@ -652,7 +678,13 @@ class SSEClient {
 
 		if (oldState !== newState) {
 			for (const handler of this.stateHandlers) {
-				handler(newState);
+				// 与事件处理器一致的异常隔离：一个订阅者抛异常
+				// 不能影响其他订阅者，也不能传播到 connect() 被误归类为连接错误
+				try {
+					handler(newState);
+				} catch (e) {
+					this.logger.error('[SSE] 状态监听器异常:', e);
+				}
 			}
 		}
 	}
