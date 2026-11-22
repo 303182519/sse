@@ -7,7 +7,7 @@ interface SSEEvent {
 
 function parseSSEEvent(text: string): SSEEvent {
 	const result: SSEEvent = { data: '' };
-	const lines = text.split('\n');
+	const lines = text.split(/\r\n|\r|\n/);
 
 	for (const line of lines) {
 		if (line.startsWith(':')) continue; // 注释行，忽略
@@ -47,6 +47,7 @@ enum SSEState {
 	CLOSED = 'closed',
 }
 
+
 type StateTransition =
 	| { from: SSEState.IDLE; to: SSEState.CONNECTING }
 	| { from: SSEState.CONNECTING; to: SSEState.OPEN }
@@ -56,7 +57,6 @@ type StateTransition =
 	| { from: SSEState.RECONNECTING; to: SSEState.CLOSED }
 	| { from: SSEState.IDLE; to: SSEState.CLOSED }
 	| { from: SSEState.OPEN; to: SSEState.CLOSED };
-
 
 type SSEEventHandler = (event: SSEEvent) => void;
 type StateChangeHandler = (state: SSEState) => void;
@@ -116,21 +116,28 @@ class SSEClient {
 	private stateHandlers = new Set<StateChangeHandler>();
 	private middlewares: SSEMiddleware[] = [];
 
-	private reconnectStrategy: ReconnectStrategy = {
-		maxRetries: 5,
-		baseDelay: 1000,
-		maxDelay: 30000,
-		jitter: true,
-		...this.options.reconnect,
-	};
+	private reconnectStrategy: ReconnectStrategy;
 
-	constructor(private options: SSEClientOptions) { }
+	constructor(private options: SSEClientOptions) {
+		this.reconnectStrategy = {
+			maxRetries: 5,
+			baseDelay: 1000,
+			maxDelay: 30000,
+			jitter: true,
+			...options.reconnect,
+		};
+	}
 
 	// === 连接管理 ===
 
 	async connect(): Promise<void> {
 		if (this.state === SSEState.OPEN || this.state === SSEState.CONNECTING) {
 			return; // 防止重复连接
+		}
+
+		// 从 CLOSED 状态手动重连时，重置重试预算
+		if (this.state === SSEState.CLOSED) {
+			this.retryCount = 0;
 		}
 
 		this.transition(SSEState.CONNECTING);
@@ -155,7 +162,11 @@ class SSEClient {
 			});
 
 			if (!response.ok) {
-				throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+				const error: Error & { status?: number } = new Error(
+					`HTTP ${response.status}: ${response.statusText}`
+				);
+				error.status = response.status;
+				throw error;
 			}
 
 			this.retryCount = 0;
@@ -191,13 +202,13 @@ class SSEClient {
 				const { done, value } = await reader.read();
 
 				if (done) {
-					// 正常结束，触发重连
+					// 服务端关闭了事件流（EOF）。SSE 是长连接，不应主动结束，视为意外断开，触发重连
 					this.tryReconnect(new Error('Stream ended unexpectedly'));
 					break;
 				}
 
 				buffer += decoder.decode(value, { stream: true });
-				const events = buffer.split('\n\n');
+				const events = buffer.split(/\r\n\r\n|\r\r|\n\n/);
 				buffer = events.pop()!;
 
 				for (const eventText of events) {
@@ -267,24 +278,46 @@ class SSEClient {
 
 	private dispatchEvent(event: SSEEvent): void {
 		// 执行中间件管道
-		let processedEvent = event;
+		let current = event;
 		for (const middleware of this.middlewares) {
-			processedEvent = middleware.onEvent(processedEvent);
-			if (!processedEvent) return; // 中间件可以吞掉事件
+			let next: SSEEvent | null;
+			try {
+				next = middleware.onEvent(current);
+			} catch (e) {
+				console.error('[SSE] 中间件异常:', e);
+				continue;
+			}
+			if (!next) return; // 中间件可以吞掉事件
+			current = next;
 		}
 
-		const eventType = processedEvent.event ?? 'message';
-		const handlers = this.eventHandlers.get(eventType);
-		if (handlers) {
-			for (const handler of handlers) {
-				try {
-					handler(processedEvent);
-				} catch (e) {
-					console.error('[SSE] 事件处理器异常:', e);
-				}
+		this.emit(current.event ?? 'message', current);
+	}
+
+	// 向指定事件的处理器分发事件
+	private emit(event: string, sseEvent: SSEEvent): void {
+		const handlers = this.eventHandlers.get(event);
+		if (!handlers) return;
+
+		for (const handler of handlers) {
+			try {
+				handler(sseEvent);
+			} catch (e) {
+				console.error('[SSE] 事件处理器异常:', e);
 			}
 		}
 	}
+
+	// 从错误对象中读取 HTTP 状态码
+	private extractHttpStatus(error: Error): number | undefined {
+		return (error as Error & { status?: number }).status;
+	}
+
+	// 以错误事件的形式通知处理器
+	private emitError(event: string, error: Error): void {
+		this.emit(event, { event, data: error.message });
+	}
+
 	private handleError(error: Error): void {
 		const status = this.extractHttpStatus(error);
 
@@ -294,13 +327,13 @@ class SSEClient {
 				case status === 401:
 					// 鉴权过期，需要刷新token
 					this.transition(SSEState.CLOSED);
-					this.emit('auth_error', error);
+					this.emitError('auth_error', error);
 					break;
 
 				case status === 403:
 					// 禁止访问，彻底放弃
 					this.transition(SSEState.CLOSED);
-					this.emit('forbidden', error);
+					this.emitError('forbidden', error);
 					break;
 
 				case status === 429:
@@ -312,7 +345,7 @@ class SSEClient {
 				case status >= 400 && status < 500:
 					// 其他4xx，不重连
 					this.transition(SSEState.CLOSED);
-					this.emit('client_error', error);
+					this.emitError('client_error', error);
 					break;
 
 				// 5xx错误：服务端问题，可以重连
